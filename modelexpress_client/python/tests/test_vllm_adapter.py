@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+import torch.nn as nn
 
 from modelexpress.engines.vllm.adapter import (
     VllmAdapter,
@@ -94,6 +95,24 @@ def test_vllm_is_cuda_alike_uses_current_platform(
     adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
 
     assert adapter.is_cuda_alike() is True
+
+
+def test_vllm_adapter_discovery_uses_backend_predicate(
+    monkeypatch,
+    mock_accelerator_backend_cls,
+):
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.accelerator_backend_for",
+        lambda device: backend,
+    )
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.randn(4, 3))
+
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
+
+    assert list(tensors) == ["weight"]
 
 
 def test_build_vllm_load_context_uses_current_platform_for_bare_cuda(monkeypatch):

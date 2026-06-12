@@ -60,8 +60,8 @@ class VllmAdapter(EngineAdapter):
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         if result.model is None:
             raise RuntimeError("vLLM tensor discovery requires result.model")
-        adopt_hidden_tensors(result.model)
-        return collect_module_tensors(result.model)
+        adopt_hidden_tensors(result.model, self.accelerator_backend)
+        return collect_module_tensors(result.model, self.accelerator_backend)
 
     def prepare_rdma_target(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -156,7 +156,7 @@ class VllmAdapter(EngineAdapter):
 
         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
-        with capture_tensor_attrs():
+        with capture_tensor_attrs(self.accelerator_backend):
             process_weights_after_loading(
                 result.model, self.model_config, self.target_device,
             )

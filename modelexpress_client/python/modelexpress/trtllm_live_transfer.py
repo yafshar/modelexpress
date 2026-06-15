@@ -130,6 +130,7 @@ def publish_model_params(torch_model: Any) -> None:
         worker_rank=mpi_rank,
         nixl_metadata=nixl_mgr.nixl_metadata,
         tensor_source=tensor_source_metadata(tensor_protos),
+        accelerator="cuda",
     )
 
     identity = _build_trtllm_identity(model_name=model_name)
@@ -246,6 +247,7 @@ def publish_from_worker(worker: Any) -> None:
         worker_rank=mpi_rank,
         nixl_metadata=nixl_mgr.nixl_metadata,
         tensor_source=tensor_source_metadata(tensor_protos),
+        accelerator="cuda",
     )
 
     identity = _build_trtllm_identity(model_name=model_name)

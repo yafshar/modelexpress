@@ -41,6 +41,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         metadata_endpoint: str = "",
         agent_name: str = "",
         worker_rank: int = 0,
+        accelerator: str = "",
         artifact_manifests: Mapping[str, p2p_pb2.ArtifactManifest] | None = None,
         artifact_chunk_manager: Any | None = None,
     ):
@@ -49,6 +50,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         self._metadata_endpoint = metadata_endpoint
         self._agent_name = agent_name
         self._worker_rank = worker_rank
+        self._accelerator = accelerator
         self._artifact_manifests = dict(artifact_manifests or {})
         self._artifact_chunk_manager = artifact_chunk_manager
 
@@ -60,6 +62,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             metadata_endpoint=self._metadata_endpoint,
             agent_name=self._agent_name,
             worker_rank=self._worker_rank,
+            accelerator=self._accelerator,
         )
         logger.info(
             f"GetTensorManifest served: {len(self._tensor_protos)} tensors, "
@@ -257,6 +260,7 @@ class WorkerGrpcServer:
         metadata_endpoint: str = "",
         agent_name: str = "",
         worker_rank: int = 0,
+        accelerator: str = "",
         artifact_manifests: Mapping[str, p2p_pb2.ArtifactManifest] | None = None,
         artifact_chunk_manager: Any | None = None,
         max_workers: int = 4,
@@ -269,6 +273,7 @@ class WorkerGrpcServer:
         self._metadata_endpoint = metadata_endpoint
         self._agent_name = agent_name
         self._worker_rank = worker_rank
+        self._accelerator = accelerator
         self._artifact_manifests = dict(artifact_manifests or {})
         self._artifact_chunk_manager = artifact_chunk_manager
         self._max_workers = max_workers
@@ -290,6 +295,7 @@ class WorkerGrpcServer:
             metadata_endpoint=self._metadata_endpoint,
             agent_name=self._agent_name,
             worker_rank=self._worker_rank,
+            accelerator=self._accelerator,
             artifact_manifests=self._artifact_manifests,
             artifact_chunk_manager=self._artifact_chunk_manager,
         )

@@ -116,6 +116,7 @@ def publish_metadata_and_ready(
     device_id: int,
     identity: "p2p_pb2.SourceIdentity",
     worker_id: str,
+    accelerator: str = "cuda",
 ) -> None:
     """Publish tensor metadata and ready flag to the ModelExpress server."""
     logger.info(
@@ -137,6 +138,7 @@ def publish_metadata_and_ready(
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint="",
+            accelerator=accelerator,
         )
         mx_source_id = _publish_metadata_to_server(
             mx_client=mx_client,
@@ -153,6 +155,7 @@ def publish_metadata_and_ready(
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_rank=worker_rank,
+            accelerator=accelerator,
         )
         actual_port = grpc_server.start()
         _worker_servers[device_id] = grpc_server
@@ -162,6 +165,7 @@ def publish_metadata_and_ready(
             metadata_endpoint=f"{host}:{nixl_manager._listen_port}",
             agent_name=nixl_manager.agent_name,
             worker_grpc_endpoint=f"{host}:{actual_port}",
+            accelerator=accelerator,
         )
         mx_source_id = _publish_metadata_to_server(
             mx_client=mx_client,
@@ -179,6 +183,7 @@ def publish_metadata_and_ready(
             worker_rank=worker_rank,
             nixl_metadata=nixl_manager.nixl_metadata,
             tensor_source=tensor_source_metadata(tensor_protos),
+            accelerator=accelerator,
         )
         mx_source_id = _publish_metadata_to_server(
             mx_client=mx_client,

@@ -57,7 +57,7 @@ Workers use `torch.distributed.get_rank()` as their global rank, which captures 
 
 ### Runtime Accelerator Compatibility
 
-`WorkerMetadata.accelerator` records the source worker's runtime accelerator family, such as `cuda`, from the active `AcceleratorBackend.name`. This field is used only for source compatibility filtering. It is not folded into `SourceIdentity`, does not affect `mx_source_id`, and does not change the Rust/Python pinned source-ID cross-check hashes.
+`WorkerMetadata.accelerator` records the source worker's runtime accelerator family, such as `cuda` or `xpu`, from the active `AcceleratorBackend.name`. This field is used only for source compatibility filtering. It is not folded into `SourceIdentity`, does not affect `mx_source_id`, and does not change the Rust/Python pinned source-ID cross-check hashes.
 
 Targets treat an empty `accelerator` value as unknown and do not reject it, which keeps transfers backward compatible with metadata published before this field existed. If both source and target publish non-empty accelerator values and they differ, the target skips that source after fetching metadata and before target preparation or RDMA receive.
 

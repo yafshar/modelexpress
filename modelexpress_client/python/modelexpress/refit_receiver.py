@@ -374,13 +374,15 @@ class MxRefitReceiver:
             f"({sum(t.numel() * t.element_size() for t in scratch_tensors.values()) / 1e9:.2f} GB)"
         )
 
-        self._nixl.register_tensors(scratch_tensors)
-
-        transferred, skipped, elapsed = self._nixl.receive_from_source(
-            source_metadata=worker.nixl_metadata,
-            source_tensors=source_tensors,
-            timeout_seconds=timeout_seconds,
-        )
+        # Scratch buffers are RDMA targets for this receive only. Scope
+        # their NIXL registration to the transfer so repeated refits do
+        # not accumulate stale MRs or replace pre-registered model buffers.
+        with self._nixl.temporary_registered_tensors(scratch_tensors):
+            transferred, skipped, elapsed = self._nixl.receive_from_source(
+                source_metadata=worker.nixl_metadata,
+                source_tensors=source_tensors,
+                timeout_seconds=timeout_seconds,
+            )
 
         bandwidth_gbps = (transferred * 8) / (elapsed * 1e9) if elapsed > 0 else 0.0
         logger.info(

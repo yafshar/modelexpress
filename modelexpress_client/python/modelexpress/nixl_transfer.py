@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -184,6 +185,11 @@ class NixlTransferManager:
         self._metadata: bytes = b""
         self._tensor_descriptors: list[TensorDescriptor] = []
         self._tensors: dict[str, torch.Tensor] = {}
+        # NIXL memory-registration handles returned by register_memory.
+        # register_tensors / register_arena append here; shutdown drains
+        # them so repeated registrations (e.g. per-refit scratch buffers
+        # in receive_weights_scratch) do not leak MRs over freed memory.
+        self._tensor_registrations: list[Any] = []
         # Memory type of the LOCAL tensors registered via register_tensors.
         # Set by register_tensors from the first tensor's device; used by
         # the transfer paths' prep_xfer_dlist local-side call. Defaults
@@ -354,7 +360,23 @@ class NixlTransferManager:
         self._local_mem_type = _resolve_local_mem_type(tensors)
 
         tensor_descriptors = self._build_tensor_descriptors(tensors)
+        registered = self._register_tensor_memory(tensors, tensor_descriptors)
+        self._record_tensor_registration(registered)
 
+        return self._metadata
+
+    def _register_tensor_memory(
+        self,
+        tensors: dict[str, torch.Tensor],
+        tensor_descriptors: list[TensorDescriptor],
+    ) -> Any:
+        """Register tensor memory with NIXL and refresh agent metadata.
+
+        Returns the NIXL registration handle from ``register_memory`` so
+        callers can deregister it later (e.g. shutdown, or the
+        :meth:`temporary_registered_tensors` scoped path). Requires
+        ``self._local_mem_type`` to already reflect the tensor set.
+        """
         # Phase 1: Discover CUDA allocation boundaries (if pool reg enabled)
         # Pool registration only applies to CUDA tensors — the discovery
         # path calls cuMemGetAddressRange, which is a device-memory API.
@@ -391,7 +413,7 @@ class NixlTransferManager:
                 (base, size, self._device_id, "")
                 for base, size in allocations
             ]
-            self._agent.register_memory(
+            registered = self._agent.register_memory(
                 alloc_tuples,
                 mem_type=self._accelerator_backend.nixl_mem_type,
                 backends=self._backends,
@@ -403,7 +425,7 @@ class NixlTransferManager:
             # explicitly — NIXL's torch-tensor auto-detect keys off
             # tensor.is_cuda but the explicit path leaves nothing to
             # infer.
-            self._agent.register_memory(
+            registered = self._agent.register_memory(
                 tensor_list,
                 mem_type=self._local_mem_type,
                 backends=self._backends,
@@ -431,7 +453,53 @@ class NixlTransferManager:
             f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB total"
         )
 
-        return self._metadata
+        return registered
+
+    def _record_tensor_registration(self, registered: Any) -> None:
+        """Track a registration handle for deregistration at shutdown."""
+        if registered is not None:
+            self._tensor_registrations.append(registered)
+
+    def _deregister_registered_memory(self, registered: Any) -> None:
+        """Deregister a NIXL handle and refresh agent metadata (no-op if None)."""
+        if registered is not None and self._agent is not None:
+            self._agent.deregister_memory(registered)
+            self._metadata = self._agent.get_agent_metadata()
+
+    @contextmanager
+    def temporary_registered_tensors(self, tensors: dict[str, torch.Tensor]):
+        """Register tensors for one receive, then deregister on exit.
+
+        Scratch buffers in ``receive_weights_scratch`` are RDMA targets for
+        a single refit cycle only. Registering them via
+        :meth:`register_tensors` would leak their NIXL MRs (the scratch
+        memory is freed after the yield) and clobber any pre-registered
+        model buffers in ``self._tensors``. This context manager registers
+        the scratch set, restores the persistent local tensor state on
+        exit, and always deregisters the scratch MR — even on transfer
+        failure or early generator close.
+        """
+        if self._agent is None:
+            raise RuntimeError("NIXL agent not initialized")
+
+        saved_tensors = self._tensors
+        saved_tensor_descriptors = self._tensor_descriptors
+        saved_metadata = self._metadata
+        saved_local_mem_type = self._local_mem_type
+
+        self._local_mem_type = _resolve_local_mem_type(tensors)
+        tensor_descriptors = self._build_tensor_descriptors(tensors)
+        registered = self._register_tensor_memory(tensors, tensor_descriptors)
+        try:
+            yield self._metadata
+        finally:
+            try:
+                self._deregister_registered_memory(registered)
+            finally:
+                self._tensors = saved_tensors
+                self._tensor_descriptors = saved_tensor_descriptors
+                self._metadata = saved_metadata
+                self._local_mem_type = saved_local_mem_type
 
     def rebind_tensors(self, tensors: dict[str, torch.Tensor]) -> None:
         """Point the active local tensor set at ``tensors`` without re-registering.
@@ -511,7 +579,7 @@ class NixlTransferManager:
             return self.register_tensors(tensors)
 
         nixl_reg_start = time.perf_counter()
-        self._agent.register_memory(
+        registered = self._agent.register_memory(
             [(base, used, self._device_id, "")],
             mem_type=self._accelerator_backend.nixl_mem_type,
             backends=self._backends,
@@ -534,6 +602,8 @@ class NixlTransferManager:
             f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB live in "
             f"{used / 1e9:.2f} GB arena bump range"
         )
+
+        self._record_tensor_registration(registered)
 
         return self._metadata
 
@@ -970,9 +1040,7 @@ class NixlTransferManager:
         """Deregister a memory descriptor returned by register_memory."""
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
-        if registered is not None:
-            self._agent.deregister_memory(registered)
-            self._metadata = self._agent.get_agent_metadata()
+        self._deregister_registered_memory(registered)
 
     def receive_dram_into_buffer(
         self,
@@ -1063,7 +1131,17 @@ class NixlTransferManager:
         even if a future caller bypasses ``register_tensors`` and
         aliases ``_tensors`` directly, shutdown will not mutate the
         shared container out from under them.
+
+        Deregisters any NIXL registration handles recorded by
+        ``register_tensors`` / ``register_arena`` before dropping the
+        agent, so long-lived managers do not leak MRs.
         """
+        for registered in reversed(self._tensor_registrations):
+            try:
+                self._deregister_registered_memory(registered)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Failed to deregister NIXL tensor memory during shutdown: %s", e)
+        self._tensor_registrations = []
         self._agent = None
         self._metadata = b""
         self._tensor_descriptors = []

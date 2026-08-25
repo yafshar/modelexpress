@@ -4,10 +4,30 @@
 from unittest.mock import MagicMock, patch
 
 import modelexpress_rl
+import pytest
+from modelexpress_rl.train import resources as resources_module
 from modelexpress_rl.train.resources import _TrainerResources
 
+from tests.conftest import MockAcceleratorBackend
 
-def test_resources_initialize_transport_and_manifest_service(monkeypatch):
+
+@pytest.fixture
+def cpu_backend(monkeypatch):
+    """These tests run on CPU, which has no accelerator backend.
+
+    This call site owns a device ordinal only, which cannot tell cuda:N from
+    xpu:N, so the family comes from the process's active accelerator; that
+    resolver is the seam to stub rather than a backend argument threaded through
+    ``initialize``.
+    """
+    backend = MockAcceleratorBackend(torch_device_type="cpu")
+    monkeypatch.setattr(
+        resources_module, "current_accelerator_backend", lambda: backend
+    )
+    return backend
+
+
+def test_resources_initialize_transport_and_manifest_service(monkeypatch, cpu_backend):
     monkeypatch.setenv("MX_WORKER_HOST", "trainer.test")
     monkeypatch.setenv("MX_METADATA_PORT", "18000")
     monkeypatch.setenv("MX_WORKER_GRPC_PORT", "19000")
@@ -31,6 +51,7 @@ def test_resources_initialize_transport_and_manifest_service(monkeypatch):
     manager_type.assert_called_once_with(
         agent_name="modelexpress-trainer-7",
         device_id=2,
+        accelerator_backend=cpu_backend,
         listen_port=18002,
     )
     manager.initialize.assert_called_once_with()
@@ -61,6 +82,38 @@ def test_resources_own_only_private_transport_resources():
     server.stop.assert_called_once_with(grace=None)
     server.stop.return_value.wait.assert_called_once_with()
     manager.shutdown.assert_called_once_with()
+
+
+def test_resources_hand_the_active_accelerator_backend_to_the_transport(
+    monkeypatch, cpu_backend
+):
+    """The transport must never fall back to the CUDA default.
+
+    ``NixlTransferManager`` defaults to ``CudaAcceleratorBackend`` and
+    ``initialize()`` calls ``set_device()`` on it, so a non-CUDA trainer that
+    omits the backend dies in ``torch.cuda.set_device`` before registering.
+    """
+    monkeypatch.setenv("MX_WORKER_HOST", "trainer.test")
+    monkeypatch.setenv("MX_METADATA_PORT", "18000")
+    monkeypatch.setenv("MX_WORKER_GRPC_PORT", "19000")
+    monkeypatch.delenv("RANK", raising=False)
+    server = MagicMock()
+    server.add_insecure_port.return_value = 19003
+
+    with (
+        patch(
+            "modelexpress.nixl_transfer.NixlTransferManager",
+            return_value=MagicMock(),
+        ) as manager_type,
+        patch(
+            "modelexpress_rl.train.resources.grpc.server",
+            return_value=server,
+        ),
+    ):
+        resources = _TrainerResources.initialize(device_id=3)
+
+    assert manager_type.call_args.kwargs["accelerator_backend"] is cpu_backend
+    resources.close()
 
 
 def test_resources_are_not_part_of_public_api():

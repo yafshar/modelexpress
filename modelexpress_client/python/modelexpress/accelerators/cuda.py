@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -42,6 +43,13 @@ class CudaAcceleratorBackend:
 
     def empty_cache(self) -> None:
         torch.cuda.empty_cache()
+
+    def record_completion_fence(
+        self, device_id: int | None = None
+    ) -> Callable[[], None]:
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(device_id))
+        return event.synchronize
 
     def torch_device(self, device_id: int) -> torch.device:
         return torch.device(self.torch_device_type, device_id)

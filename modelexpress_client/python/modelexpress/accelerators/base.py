@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol
 
 import torch
@@ -45,6 +46,22 @@ class AcceleratorBackend(Protocol):
 
     def empty_cache(self) -> None:
         """Release backend allocator cache where supported."""
+        ...
+
+    def record_completion_fence(
+        self, device_id: int | None = None
+    ) -> Callable[[], None]:
+        """Record a fence over work already queued on ``device_id``.
+
+        Returns a callable that blocks until the work queued on that device's
+        current stream at call time has completed. Work queued afterwards is not
+        covered, so record the fence after enqueueing and before publishing.
+        ``device_id`` defaults to the current device.
+
+        Every backend must return a callable that really waits: a no-op here
+        would let a caller publish buffers whose asynchronous copies are still
+        in flight, which fails silently rather than loudly.
+        """
         ...
 
     def torch_device(self, device_id: int) -> torch.device:

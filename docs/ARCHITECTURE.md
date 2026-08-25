@@ -748,7 +748,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `modelexpress` and `mx` loaders with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
-| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled, falls back to generic per-tensor NIXL registration, and requires no classic-allocator pool for registered buffers. Further backends can be added behind the same interface |
+| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control, completion fences, and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled, falls back to generic per-tensor NIXL registration, and requires no classic-allocator pool for registered buffers. Selection is `accelerator_backend_for(device)` for a typed device, or `current_accelerator_backend()` where only a device ordinal is available. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `refit/` | Engine-agnostic live-refit primitives. `RefitTimingRecorder` provides normalized stage timing; `reshard/` provides loader-observed geometry capture, slice/transfer planning, rendezvous, and transport abstractions |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
@@ -865,10 +865,10 @@ STALE. Long-lived framework integrations still need to call `close()` from
 their lifecycle; SIGKILL and mid-transfer failure recovery remain follow-up
 work.
 
-The receiver's device-specific work goes through `AcceleratorBackend` rather than
+Both sides' device-specific work goes through `AcceleratorBackend` rather than
 `torch.cuda` directly: per-stage synchronization, the backend handed to
-`NixlTransferManager`, and the allocation scope for its receive and staging
-buffers. `registered_buffer_alloc_scope()` selects that scope from
+`NixlTransferManager`, the allocation scope for registered buffers, and the
+completion fence a publisher takes before advertising them. `registered_buffer_alloc_scope()` selects that scope from
 `requires_classic_alloc_pool()`, which states a requirement rather than a
 capability. CUDA requires it and XPU does not: CUDA uses the
 classic-`cudaMalloc` pool in `reshard/cuda_pool.py` because its caching allocator
@@ -881,6 +881,26 @@ it out would take a real RDMA write into an XPU buffer allocated under an
 expandable-segment equivalent. `torch.xpu` does expose `MemPool` and
 `XPUPluggableAllocator`, so an alternate XPU pool could be implemented if that
 test ever says one is needed.
+
+The trainer publish path uses the same boundary. A backend is derived from a
+device wherever one is in hand, never accepted as a parameter, so a caller cannot
+pass a backend that contradicts the device it is used with: the FSDP adapter
+resolves it from the captured shards' own device (and requires this rank's shards
+to share one device), while `_TrainerResources` owns a device ordinal only - which
+cannot tell `cuda:N` from `xpu:N` - and resolves the family from the process's
+active accelerator through `current_accelerator_backend()`. That backend is not
+optional at the transport: `NixlTransferManager` defaults to CUDA and its
+`initialize()` calls `set_device()`, so a non-CUDA trainer that omits it fails in
+`torch.cuda.set_device` before registering anything.
+
+`AcceleratorBackend.record_completion_fence(device_id)` returns a callable that
+blocks until the work queued on that device's current stream at call time has
+completed; it backs the trainer adapter's `CompletionFence`. COPY_TO_DEVICE
+staging enqueues asynchronous copies into the registered arenas, so this fence is
+what keeps a generator from reading a buffer mid-copy. It is a required protocol
+member rather than a capability gate, and no backend may return a no-op: a fence
+that silently does not wait publishes in-flight buffers, which corrupts weights
+without any error, unlike a missing device operation which fails loudly.
 
 The receiver applies no publisher/target accelerator compatibility policy, and
 this is a known gap rather than a decision that cross-family refit is safe. The

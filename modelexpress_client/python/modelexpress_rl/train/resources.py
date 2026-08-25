@@ -13,6 +13,7 @@ from typing import Any
 
 import grpc
 from modelexpress import envs
+from modelexpress.accelerators import current_accelerator_backend
 
 from .. import refit_pb2_grpc
 from .manifest import WeightVersionShardManifestService
@@ -62,9 +63,15 @@ class _TrainerResources:
             if rank is not None
             else f"modelexpress-trainer-{uuid.uuid4().hex[:8]}"
         )
+        # Not optional: the manager defaults to CUDA and initialize() calls
+        # set_device() on it, so a non-CUDA trainer that omits this dies in
+        # torch.cuda.set_device before it registers anything. This call site owns
+        # an ordinal only, which cannot tell cuda:N from xpu:N, so the family
+        # comes from the process's active accelerator.
         manager = NixlTransferManager(
             agent_name=agent_name,
             device_id=device_id,
+            accelerator_backend=current_accelerator_backend(),
             listen_port=envs.MX_METADATA_PORT + device_id,
         )
         manager.initialize()

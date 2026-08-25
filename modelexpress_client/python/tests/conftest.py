@@ -33,6 +33,9 @@ class MockAcceleratorBackend:
     set_device_calls: list[int] = field(default_factory=list)
     synchronize_calls: list[int | None] = field(default_factory=list)
     empty_cache_calls: int = 0
+    # Devices a fence was recorded for, and how often the returned fences waited.
+    fence_calls: list[int | None] = field(default_factory=list)
+    fence_waits: list[int | None] = field(default_factory=list)
 
     def set_device(self, device_id: int) -> None:
         self.set_device_calls.append(device_id)
@@ -45,6 +48,14 @@ class MockAcceleratorBackend:
 
     def empty_cache(self) -> None:
         self.empty_cache_calls += 1
+
+    def record_completion_fence(self, device_id: int | None = None):
+        self.fence_calls.append(device_id)
+
+        def _wait() -> None:
+            self.fence_waits.append(device_id)
+
+        return _wait
 
     def torch_device(self, device_id: int) -> torch.device:
         return torch.device("cpu")

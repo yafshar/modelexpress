@@ -16,6 +16,7 @@ from modelexpress.accelerators import (
     CudaAcceleratorBackend,
     XpuAcceleratorBackend,
     accelerator_backend_for,
+    current_accelerator_backend,
 )
 from modelexpress.adapter import EngineAdapter
 from modelexpress.load_strategy.context import LoadResult
@@ -88,6 +89,48 @@ class TestCudaAcceleratorBackend:
     def test_accelerator_backend_for_rejects_unsupported_device(self):
         with pytest.raises(ValueError, match="supported device types"):
             accelerator_backend_for(torch.device("cpu"))
+
+    def test_cuda_backend_fence_records_on_the_requested_device_stream(
+        self,
+        monkeypatch,
+    ):
+        recorded = []
+
+        class FakeEvent:
+            def record(self, stream):
+                recorded.append(stream)
+
+            def synchronize(self):
+                recorded.append("waited")
+
+        monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+        monkeypatch.setattr(
+            torch.cuda, "current_stream", lambda device_id=None: ("stream", device_id)
+        )
+
+        wait = CudaAcceleratorBackend().record_completion_fence(2)
+        assert recorded == [("stream", 2)]
+        wait()
+        assert recorded == [("stream", 2), "waited"]
+
+    def test_cuda_backend_fence_defaults_to_the_current_device(self, monkeypatch):
+        recorded = []
+
+        class FakeEvent:
+            def record(self, stream):
+                recorded.append(stream)
+
+            def synchronize(self):
+                pass
+
+        monkeypatch.setattr(torch.cuda, "Event", FakeEvent)
+        monkeypatch.setattr(
+            torch.cuda, "current_stream", lambda device_id=None: ("stream", device_id)
+        )
+
+        CudaAcceleratorBackend().record_completion_fence()
+
+        assert recorded == [("stream", None)]
 
 
 class TestXpuAcceleratorBackend:
@@ -201,6 +244,63 @@ class TestXpuAcceleratorBackend:
 
         with pytest.raises(ValueError, match="torch.xpu is not available"):
             accelerator_backend_for(torch.device("xpu:0"))
+
+    def test_xpu_backend_fence_records_on_the_requested_device_stream(
+        self,
+        monkeypatch,
+    ):
+        recorded = []
+
+        class FakeEvent:
+            def record(self, stream):
+                recorded.append(stream)
+
+            def synchronize(self):
+                recorded.append("waited")
+
+        fake_xpu = SimpleNamespace(
+            Event=FakeEvent,
+            current_stream=lambda device_id=None: ("stream", device_id),
+        )
+        monkeypatch.setattr(torch, "xpu", fake_xpu, raising=False)
+
+        wait = XpuAcceleratorBackend().record_completion_fence(2)
+        assert recorded == [("stream", 2)]
+        wait()
+        assert recorded == [("stream", 2), "waited"]
+
+    def test_xpu_backend_fence_requires_the_xpu_runtime(self, monkeypatch):
+        monkeypatch.setattr(torch, "xpu", None, raising=False)
+
+        with pytest.raises(RuntimeError, match="torch.xpu is not available"):
+            XpuAcceleratorBackend().record_completion_fence(0)
+
+
+class TestCurrentAcceleratorBackend:
+    """The device_id-only call sites resolve the family from torch itself."""
+
+    def test_resolves_the_active_cuda_accelerator(self, monkeypatch):
+        monkeypatch.setattr(
+            torch.accelerator, "current_accelerator", lambda: torch.device("cuda")
+        )
+
+        assert isinstance(current_accelerator_backend(), CudaAcceleratorBackend)
+
+    def test_resolves_the_active_xpu_accelerator(self, monkeypatch):
+        monkeypatch.setattr(
+            torch, "xpu", SimpleNamespace(is_available=lambda: True), raising=False
+        )
+        monkeypatch.setattr(
+            torch.accelerator, "current_accelerator", lambda: torch.device("xpu")
+        )
+
+        assert isinstance(current_accelerator_backend(), XpuAcceleratorBackend)
+
+    def test_rejects_a_process_without_an_accelerator(self, monkeypatch):
+        monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: None)
+
+        with pytest.raises(ValueError, match="No active torch accelerator"):
+            current_accelerator_backend()
 
 
 class TestAcceleratorCapabilityGates:

@@ -222,14 +222,25 @@ class TestStageSynchronization:
 
     def test_receiver_module_holds_no_direct_torch_cuda_call(self):
         """A regression fence: the point of the backend boundary is that this file
-        names no accelerator directly."""
+        names no accelerator directly.
+
+        Parsed rather than grepped, so prose is not code: the module explains the
+        boundary it enforces, and a docstring saying "not ``torch.cuda``" must not
+        read as a violation of it.
+        """
+        import ast
         from pathlib import Path
 
         import modelexpress.refit.reshard.receiver as receiver_module
 
-        source = Path(receiver_module.__file__).read_text()
-        code = "\n".join(
-            line for line in source.splitlines() if not line.strip().startswith("#")
-        )
-        assert "torch.cuda" not in code
-        assert "torch.xpu" not in code
+        tree = ast.parse(Path(receiver_module.__file__).read_text())
+        accessed = {
+            f"torch.{node.attr}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "torch"
+        }
+
+        assert "torch.cuda" not in accessed
+        assert "torch.xpu" not in accessed

@@ -17,6 +17,7 @@ __all__ = [
     "CudaAcceleratorBackend",
     "XpuAcceleratorBackend",
     "accelerator_backend_for",
+    "current_accelerator_backend",
 ]
 
 
@@ -59,3 +60,20 @@ def accelerator_backend_for(device: torch.device | str) -> AcceleratorBackend:
         "Unsupported accelerator backend for torch device "
         f"{torch_device!s}; supported device types: {_supported_device_types()}"
     )
+
+
+def current_accelerator_backend() -> AcceleratorBackend:
+    """Return the backend for the process's active torch accelerator.
+
+    For call sites that own a device ordinal but no device type: an ordinal alone
+    cannot tell ``cuda:0`` from ``xpu:0``. Prefer
+    :func:`accelerator_backend_for` wherever a typed device is available, so the
+    backend cannot contradict the device it is used with.
+    """
+    device = torch.accelerator.current_accelerator()
+    if device is None:
+        raise ValueError(
+            "No active torch accelerator; supported device types: "
+            f"{_supported_device_types()}"
+        )
+    return accelerator_backend_for(device)

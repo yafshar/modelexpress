@@ -27,7 +27,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress.accelerators import AcceleratorBackend, accelerator_backend_for
+from modelexpress.refit.reshard.alloc_scope import registered_buffer_alloc_scope
 from modelexpress_rl.train.adapter import (
     CompletionFence,
     NixlMetadataProvider,
@@ -71,6 +72,11 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         self._expected_layout: dict[
             str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
         ] = {}
+        # COPY: the accelerator the arenas live on, and its backend. Derived from
+        # the captured shards at initialize() rather than passed in, so the
+        # backend cannot contradict the device the arenas are allocated on.
+        self._backend: AcceleratorBackend | None = None
+        self._arena_device_id: int | None = None
         self._arenas: dict[str, torch.Tensor] = {}  # COPY: name -> registered arena
         # name -> the address we registered (the arena for COPY, the live source
         # for IN_PLACE). The served buffer must keep sitting here.
@@ -127,11 +133,22 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         # - register via a single VmmArena + register_arena (one dmabuf MR).
         # - env var to stage into CPU pinned host memory vs GPU device memory
         #   (host staging frees device memory when the GPU is tight).
-        with classic_cuda_alloc():
+        device = self._require_single_device(shards)
+        try:
+            self._backend = accelerator_backend_for(device)
+        except ValueError as exc:
+            # The arenas are RDMA-registered, so they have to live on an
+            # accelerator. Say that, rather than letting the backend lookup
+            # report an unsupported device type from three frames down.
+            raise NotImplementedError(
+                "COPY_TO_DEVICE stages this rank's shards into registered arenas "
+                f"on an accelerator, but the state_dict is on {device}; a "
+                "CPU-offloaded state_dict cannot be staged this way"
+            ) from exc
+        self._arena_device_id = device.index
+        with registered_buffer_alloc_scope(self._backend):
             self._arenas = {
-                s.name: torch.empty(
-                    s.local_shape, dtype=WIRE_DTYPE, device=s.source_tensor.device
-                )
+                s.name: torch.empty(s.local_shape, dtype=WIRE_DTYPE, device=device)
                 for s in shards
             }
         self._manager.register_tensors(
@@ -198,17 +215,21 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
 
         ``copy_`` casts to bf16 only when the source dtype differs. The arena is
         the served buffer, so point each shard at it.
+
+        The copies are asynchronous, so the fence is what keeps the published
+        buffers from being read mid-copy. It is taken from the arenas' own
+        accelerator backend and is never a no-op: a caller that cannot fence must
+        fail here rather than publish in-flight buffers.
         """
-        stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
+        if self._backend is None:
+            raise RuntimeError("COPY_TO_DEVICE arenas are not initialized")
         for shard in shards:
             arena = self._arenas[shard.name]
             arena.copy_(shard.source_tensor)
             shard.staging_tensor = arena
-        if stream is not None:
-            done = torch.cuda.Event()
-            done.record(stream)
-            return CompletionFence(done.synchronize)
-        return CompletionFence(lambda: None)
+        return CompletionFence(
+            self._backend.record_completion_fence(self._arena_device_id)
+        )
 
     def _require_sources_pinned(self, shards: list[LocalTensorShard]) -> None:
         """Fail unless every source still sits where it was registered.
@@ -250,6 +271,18 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
                     f"(was {self._expected_layout[shard.name]}, now {layout}); "
                     "a trainer must keep a fixed shard layout across steps"
                 )
+
+    @staticmethod
+    def _require_single_device(shards: list[LocalTensorShard]) -> torch.device:
+        """Return the one device every shard lives on, or fail loudly."""
+        devices = {s.source_tensor.device for s in shards}
+        if len(devices) != 1:
+            raise NotImplementedError(
+                "COPY_TO_DEVICE stages this rank's shards into arenas on one "
+                "accelerator; the state_dict spans "
+                f"{sorted(str(device) for device in devices)}"
+            )
+        return devices.pop()
 
     @staticmethod
     def _register_key(index: int, name: str) -> str:

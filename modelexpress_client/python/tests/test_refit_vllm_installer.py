@@ -5,6 +5,7 @@ import sys
 from contextlib import contextmanager
 from types import ModuleType
 
+import modelexpress_rl.inference.engines.vllm.installer as installer_module
 import pytest
 import torch
 from torch import nn
@@ -14,6 +15,22 @@ from modelexpress_rl.inference.engines.vllm.installer import (
     _update_mla_absorbed_weights,
     _VllmInstaller,
 )
+from tests.conftest import MockAcceleratorBackend
+
+
+@pytest.fixture(autouse=True)
+def _cpu_backend(monkeypatch):
+    """These tests run on CPU, which has no accelerator backend.
+
+    The installer derives its backend from ``device`` so the two cannot disagree,
+    which is the bug class being fixed; that leaves the lookup as the seam to
+    stub rather than a backend argument threaded through the constructor.
+    """
+    monkeypatch.setattr(
+        installer_module,
+        "accelerator_backend_for",
+        lambda _device: MockAcceleratorBackend(torch_device_type="cpu"),
+    )
 
 
 def _install_fake_vllm(monkeypatch, initialize):

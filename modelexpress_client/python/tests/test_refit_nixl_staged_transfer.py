@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from contextlib import nullcontext
-
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
 import torch
@@ -28,6 +26,22 @@ from modelexpress_rl.inference.nixl_staged_transfer import (
     _resolve_sources,
     _ResolvedSources,
 )
+from tests.conftest import MockAcceleratorBackend
+
+
+@pytest.fixture(autouse=True)
+def _cpu_backend(monkeypatch):
+    """These tests run on CPU, which has no accelerator backend.
+
+    The transfer derives its backend from ``device`` so the two cannot disagree,
+    which is the bug class being fixed; that leaves the lookup as the seam to
+    stub rather than a backend argument threaded through the constructor.
+    """
+    monkeypatch.setattr(
+        transfer_module,
+        "accelerator_backend_for",
+        lambda _device: MockAcceleratorBackend(torch_device_type="cpu"),
+    )
 
 
 def _manifest(*, agent_name: str, endpoint: str, offset: int, address: int) -> bytes:
@@ -244,10 +258,89 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
     assert calls == ["initialize", "shutdown", "shutdown"]
 
 
-def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):
-    monkeypatch.setattr(transfer_module, "classic_cuda_alloc", nullcontext)
+def test_transfer_hands_its_device_backend_to_the_nixl_manager(monkeypatch):
+    """The manager must not be left to its CUDA default.
+
+    ``NixlTransferManager`` falls back to ``CudaAcceleratorBackend`` when no
+    backend is passed, and ``initialize()`` calls ``set_device()`` on it. A
+    non-CUDA generator that omits the argument therefore dies in
+    ``torch.cuda.set_device`` before registering anything, so asserting the
+    argument arrives is asserting the generator can start at all off CUDA.
+    """
+    seen = {}
+    backend = MockAcceleratorBackend(torch_device_type="cpu")
+
+    class _Manager:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def initialize(self):
+            pass
+
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(transfer_module, "NixlTransferManager", _Manager)
+    monkeypatch.setattr(
+        transfer_module, "accelerator_backend_for", lambda _device: backend
+    )
+
+    transfer = _NixlStagedTransfer(
+        agent_name="generator",
+        device_id=0,
+        device=torch.device("cpu"),
+    )
+
+    assert seen["accelerator_backend"] is backend
+    assert transfer._backend is backend
+
+
+def test_staged_install_synchronizes_through_the_backend(monkeypatch):
+    """The post-install barrier must go through the backend, not torch.cuda.
+
+    A bare ``torch.cuda.synchronize`` here is not merely unavailable off CUDA:
+    the re-slice and dtype-cast copies above it are queued asynchronously, so a
+    barrier that does not apply to this device lets verification read buffers
+    the device has not finished writing.
+    """
+    class _Transport:
+        def read(self, _descriptors):
+            pass
+
+    backend = MockAcceleratorBackend(torch_device_type="cpu")
+    prepared = _PreparedNixlTransfer(
+        plan=TransferPlan(),
+        capture=CaptureResult(),
+        sources={},
+        descriptors=(),
+        transport=_Transport(),
+        plan_revision=1,
+    )
+
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._device = torch.device("cpu")
+    transfer._backend = backend
+    transfer._closed = False
+    transfer._active = prepared
+    transfer._recv_buffers = {}
+    transfer._convert_buffers = {}
+    transfer._full_buffers = {}
+    monkeypatch.setattr(_NixlStagedTransfer, "_verify", lambda _self, _prepared: None)
+
+    transfer.stage(prepared)
+
+    # None because a CPU device carries no index; the point is that the barrier
+    # was taken on the backend at all rather than on torch.cuda.
+    assert backend.synchronize_calls == [None]
+
+
+def test_registered_workspace_is_reused_only_for_the_same_layout():
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._device = torch.device("cpu")
+    # __init__ is bypassed here, so the autouse fixture's patched lookup never
+    # runs; the stub backend reports no pool requirement, which is what keeps
+    # the allocation scope a no-op on CPU.
+    transfer._backend = MockAcceleratorBackend(torch_device_type="cpu")
     buffers = {}
     layout = {"weight": ((4,), torch.float32)}
 

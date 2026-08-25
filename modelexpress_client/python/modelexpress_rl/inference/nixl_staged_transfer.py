@@ -17,8 +17,9 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.nixl_transfer import NixlTransferManager
-from modelexpress.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress.refit.reshard.alloc_scope import registered_buffer_alloc_scope
 from modelexpress.refit.reshard.rendezvous import (
     build_sources,
     merge_shard_tables,
@@ -245,9 +246,14 @@ class _NixlStagedTransfer:
     ) -> None:
         self._device = device
         self._timeout = timeout_seconds
+        self._backend = accelerator_backend_for(device)
+        # Not optional: the manager defaults to CUDA and initialize() calls
+        # set_device() on it, so a non-CUDA generator that omits this dies in
+        # torch.cuda.set_device before it registers anything.
         self._manager = NixlTransferManager(
             agent_name=agent_name,
             device_id=device_id,
+            accelerator_backend=self._backend,
         )
         try:
             self._manager.initialize()
@@ -369,7 +375,7 @@ class _NixlStagedTransfer:
                     f"{label} layout changed; restart the generator engine"
                 )
             return
-        with classic_cuda_alloc():
+        with registered_buffer_alloc_scope(self._backend):
             current.update(
                 {
                     name: torch.empty(shape, dtype=dtype, device=self._device)
@@ -486,7 +492,7 @@ class _NixlStagedTransfer:
             self._recv_buffers[convert.param_name].copy_(
                 self._convert_buffers[convert.param_name]
             )
-        torch.cuda.synchronize(self._device)
+        self._backend.synchronize(self._device.index)
         self._verify(prepared)
 
         return _StagedNixlWeights(

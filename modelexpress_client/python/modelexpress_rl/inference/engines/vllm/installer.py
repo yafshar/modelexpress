@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.refit.reshard.geometry import capture_geometry
 from modelexpress.refit.reshard.types import IncompleteRefit
 
@@ -44,6 +45,7 @@ class _VllmInstaller:
         self._vllm_config = vllm_config
         self._model_config = model_config
         self._device = device
+        self._backend = accelerator_backend_for(device)
 
     @property
     def _is_quantized(self) -> bool:
@@ -124,7 +126,7 @@ class _VllmInstaller:
         """Install verified load-layout tensors without changing graph addresses."""
         self._process_and_commit(tensors)
         _update_mla_absorbed_weights(self._model, quantized=self._is_quantized)
-        torch.cuda.synchronize(self._device)
+        self._backend.synchronize(self._device.index)
 
     @torch.no_grad()
     def _process_and_commit(self, tensors: dict[str, torch.Tensor]) -> None:

@@ -12,9 +12,11 @@ from concurrent import futures
 from typing import Any
 
 import grpc
+
 from modelexpress import envs
 from modelexpress.accelerators import current_accelerator_backend
 
+from .. import envs as rl_envs
 from .. import refit_pb2_grpc
 from .manifest import WeightVersionShardManifestService
 
@@ -57,12 +59,11 @@ class _TrainerResources:
             "MX_WORKER_HOST",
         )
         os.environ.setdefault("MX_WORKER_HOST", host)
-        rank = os.environ.get("RANK")
-        agent_name = agent_name or (
-            f"modelexpress-trainer-{rank}"
-            if rank is not None
-            else f"modelexpress-trainer-{uuid.uuid4().hex[:8]}"
-        )
+        if agent_name is None:
+            process_id = uuid.uuid4().hex[:8]
+            rank = rl_envs.RANK
+            rank_segment = f"{rank}-" if rank is not None else ""
+            agent_name = f"modelexpress-trainer-{rank_segment}{process_id}"
         # Not optional: the manager defaults to CUDA and initialize() calls
         # set_device() on it, so a non-CUDA trainer that omits this dies in
         # torch.cuda.set_device before it registers anything. This call site owns

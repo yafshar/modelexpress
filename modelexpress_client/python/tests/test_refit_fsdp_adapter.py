@@ -251,6 +251,56 @@ def test_copy_to_device_rejects_shards_on_more_than_one_device(dist_ready, cpu_b
         _stage(adapter, state_dict, mode=TrainerStagingMode.COPY_TO_DEVICE)
 
 
+def test_copy_to_device_rejects_a_source_that_changed_device(dist_ready, cpu_backend):
+    """The arenas and the fence are bound to the initialize-time device.
+
+    Geometry is unchanged here, so the layout check passes; without a device check
+    the copy would run cross-device into an arena whose fence no longer names the
+    source's device.
+    """
+    adapter = _adapter()
+    _stage(
+        adapter,
+        {"w": torch.ones(2, 4, dtype=torch.float32)},
+        mode=TrainerStagingMode.COPY_TO_DEVICE,
+    )
+
+    with pytest.raises(ValueError, match="source moved from cpu to meta"):
+        _stage(
+            adapter,
+            {"w": torch.ones(2, 4, dtype=torch.float32, device="meta")},
+            mode=TrainerStagingMode.COPY_TO_DEVICE,
+        )
+
+
+def test_in_place_rejects_a_source_that_changed_device(dist_ready):
+    """IN_PLACE publishes a raw address, which is only meaningful per device.
+
+    A migration usually trips ``_require_sources_pinned`` incidentally, because the
+    pointer changes too - that is what this input would hit without the device
+    guard, and the message then blames storage movement and suggests
+    COPY_TO_DEVICE, which does not fix a device change. The guard names the actual
+    cause, and covers the case the pointer comparison cannot distinguish: two
+    devices' address spaces holding the same integer.
+    """
+    adapter = _adapter()
+    _stage(adapter, {"w": torch.ones(2, 4, dtype=torch.bfloat16)})
+
+    with pytest.raises(ValueError, match="source moved from cpu to meta"):
+        _stage(adapter, {"w": torch.ones(2, 4, dtype=torch.bfloat16, device="meta")})
+
+
+def test_an_unchanged_device_keeps_staging(dist_ready, cpu_backend):
+    """The guard must not fire on the normal repeated-step path."""
+    adapter = _adapter()
+    state_dict = {"w": torch.ones(2, 4, dtype=torch.float32)}
+
+    for _ in range(3):
+        _stage(adapter, state_dict, mode=TrainerStagingMode.COPY_TO_DEVICE)
+
+    assert cpu_backend.fence_calls == [None, None, None]
+
+
 def test_copy_to_device_rejects_a_state_dict_that_is_not_on_an_accelerator(dist_ready):
     """The arenas are RDMA targets, so a CPU state_dict has to fail by name.
 

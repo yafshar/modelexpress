@@ -4,6 +4,7 @@
 import modelexpress_rl.inference.nixl_staged_transfer as transfer_module
 import pytest
 import torch
+from modelexpress import p2p_pb2
 from modelexpress.refit.reshard.rendezvous import (
     PublishedShard,
     PublishedTensor,
@@ -199,7 +200,6 @@ def _prepared(tensor: torch.Tensor, digest: str | None) -> _PreparedNixlTransfer
         sources={"weight": source},
         descriptors=(),
         transport=object(),
-        plan_revision=1,
     )
 
 
@@ -247,11 +247,13 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
             agent_name="generator",
             device_id=0,
             device=torch.device("cpu"),
+            listen_port=19000,
         )
     assert calls == ["initialize", "shutdown"]
 
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._manager = _Manager()
+    transfer._published_peer_rank = None
     transfer._closed = False
     transfer.close()
     transfer.close()
@@ -289,6 +291,7 @@ def test_transfer_hands_its_device_backend_to_the_nixl_manager(monkeypatch):
         agent_name="generator",
         device_id=0,
         device=torch.device("cpu"),
+        listen_port=19000,
     )
 
     assert seen["accelerator_backend"] is backend
@@ -314,7 +317,6 @@ def test_staged_install_synchronizes_through_the_backend(monkeypatch):
         sources={},
         descriptors=(),
         transport=_Transport(),
-        plan_revision=1,
     )
 
     transfer = object.__new__(_NixlStagedTransfer)
@@ -332,6 +334,169 @@ def test_staged_install_synchronizes_through_the_backend(monkeypatch):
     # None because a CPU device carries no index; the point is that the barrier
     # was taken on the backend at all rather than on torch.cuda.
     assert backend.synchronize_calls == [None]
+
+
+def test_peer_stage_uses_exact_canonical_tensor_catalog():
+    calls = []
+
+    class _Manager:
+        def register_tensors(self, tensors):
+            calls.append(("register", tuple(tensors)))
+
+        def add_remote_agent(self, metadata):
+            calls.append(("add", metadata))
+            return "peer-agent"
+
+        def fetch_remote_and_wait(self, **kwargs):
+            calls.append(("fetch", kwargs))
+
+        def receive_from_source(self, **kwargs):
+            calls.append(("receive", kwargs))
+            return 16, 1, 0.25
+
+        def remove_remote_agent(self, agent_name):
+            calls.append(("remove", agent_name))
+
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._device = torch.device("cpu")
+    transfer._timeout = 30.0
+    transfer._manager = _Manager()
+    transfer._recv_buffers = {}
+    transfer._registered_recv_params = set()
+    transfer._published_peer_rank = None
+    transfer._active = None
+    transfer._closed = False
+    # __init__ is bypassed, so the autouse fixture's patched lookup never runs.
+    # The stub reports no pool requirement, which is what keeps the peer path's
+    # buffer allocation a no-op scope on CPU.
+    transfer._backend = MockAcceleratorBackend(torch_device_type="cpu")
+    source = p2p_pb2.WorkerMetadata(
+        nixl_metadata=b"peer-metadata",
+        tensors=[
+            p2p_pb2.TensorDescriptor(
+                name="weight",
+                addr=1234,
+                size=16,
+                device_id=0,
+                dtype="torch.float32",
+            )
+        ],
+    )
+
+    staged = transfer.stage_peer(
+        source=source,
+        parameter_layout={"weight": ((4,), torch.float32)},
+    )
+
+    assert staged.metrics["bytes_received"] == 16
+    receive = next(value for name, value in calls if name == "receive")
+    assert receive["remote_agent_name"] == "peer-agent"
+    assert receive["require_exact_match"] is True
+    assert set(receive["destination_tensors"]) == {"weight"}
+    assert calls[-1] == ("remove", "peer-agent")
+
+    calls.clear()
+    source.worker_grpc_endpoint = "127.0.0.1:18000"
+    source.metadata_endpoint = "127.0.0.1:17000"
+    source.agent_name = "live-peer-agent"
+    transfer.stage_peer(
+        source=source,
+        parameter_layout={"weight": ((4,), torch.float32)},
+    )
+    fetch = next(value for name, value in calls if name == "fetch")
+    assert fetch == {
+        "remote_agent_name": "live-peer-agent",
+        "ip": "127.0.0.1",
+        "port": 17000,
+        "timeout_seconds": 30.0,
+    }
+
+    source.metadata_endpoint = ""
+    with pytest.raises(RuntimeError, match="unusable metadata endpoint"):
+        transfer.stage_peer(
+            source=source,
+            parameter_layout={"weight": ((4,), torch.float32)},
+        )
+
+
+def test_peer_republication_unpublishes_active_same_rank_source(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        transfer_module,
+        "unpublish_metadata_for_worker",
+        lambda **kwargs: calls.append(("unpublish", kwargs)),
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "publish_metadata_and_ready",
+        lambda *args, **kwargs: calls.append(("publish", args, kwargs)),
+    )
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._manager = object()
+    transfer._device_id = 2
+    transfer._published_peer_rank = 7
+    staged = transfer_module._StagedNixlWeights(
+        tensors={"weight": torch.ones(1)},
+        metrics={},
+    )
+
+    transfer.publish_peer(
+        staged=staged,
+        identity=p2p_pb2.SourceIdentity(model_name="model", revision="version-a"),
+        p2p_client=object(),
+        worker_rank=7,
+        worker_id="generator-7",
+        accelerator="cuda",
+    )
+    transfer.unpublish_peer()
+
+    assert calls[0] == (
+        "unpublish",
+        {"worker_rank": 7, "device_id": 2},
+    )
+    assert calls[1][0] == "publish"
+    assert "worker_grpc_port" not in calls[1][2]
+    assert calls[2] == (
+        "unpublish",
+        {"worker_rank": 7, "device_id": 2},
+    )
+
+
+def test_first_peer_publication_supersedes_boot_time_rank_source(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        transfer_module,
+        "unpublish_metadata_for_worker",
+        lambda **kwargs: calls.append(("unpublish", kwargs)),
+    )
+    monkeypatch.setattr(
+        transfer_module,
+        "publish_metadata_and_ready",
+        lambda *args, **kwargs: calls.append(("publish", args, kwargs)),
+    )
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._manager = object()
+    transfer._device_id = 2
+    transfer._published_peer_rank = None
+    staged = transfer_module._StagedNixlWeights(
+        tensors={"weight": torch.ones(1)},
+        metrics={},
+    )
+
+    transfer.publish_peer(
+        staged=staged,
+        identity=p2p_pb2.SourceIdentity(model_name="model", revision="version-a"),
+        p2p_client=object(),
+        worker_rank=7,
+        worker_id="generator-7",
+        accelerator="cuda",
+    )
+
+    assert calls[0] == (
+        "unpublish",
+        {"worker_rank": 7, "device_id": 2},
+    )
+    assert calls[1][0] == "publish"
 
 
 def test_registered_workspace_is_reused_only_for_the_same_layout():
